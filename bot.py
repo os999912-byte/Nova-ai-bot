@@ -569,4 +569,110 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await send_reply(update, reply, kb=kb_after_reply())
 
 
-async def
+async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query   = update.callback_query
+    user_id = update.effective_user.id
+    data    = query.data
+    await query.answer()
+
+    if data == "main_menu":
+        await query.message.reply_text("📋 *Главное меню*",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=kb_main())
+    elif data == "show_help":
+        await query.message.reply_text(
+            "📖 *Быстрая справка:*\n\n"
+            "• Просто пиши — я отвечу\n"
+            "• `/img <текст>` — генерация картинки\n"
+            "• `/stats` — статистика\n"
+            "• `/clear` — очистить историю",
+            parse_mode=ParseMode.MARKDOWN)
+    elif data == "my_stats":
+        db_upsert_user(update.effective_user)
+        s = db_get_stats(user_id)
+        joined = (s.get("joined_at") or "")[:10]
+        last   = (s.get("last_seen") or "")[:16].replace("T", " ")
+        text = (
+            "╔════════════════════════╗\n"
+            "║   📊  МОЯ СТАТИСТИКА   ║\n"
+            "╚════════════════════════╝\n\n"
+            f"👤 *Имя:* {s.get('first_name', '—')}\n"
+            f"📅 *С нами с:* `{joined}`\n"
+            f"🕐 *Последний визит:* `{last}`\n\n"
+            f"💬 *Сообщений:* *{s.get('msg_count', 0)}*\n"
+            f"🎨 *Картинок:* *{s.get('img_count', 0)}*\n"
+        )
+        await query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    elif data == "img_history":
+        items = db_get_image_history(user_id)
+        if not items:
+            text = "🖼 Картинок пока нет."
+        else:
+            lines = ["*🖼 Твои последние картинки:*\n"]
+            for i, item in enumerate(items, 1):
+                dt = (item["created_at"] or "")[:16].replace("T", " ")
+                p  = item["prompt"][:55] + ("…" if len(item["prompt"]) > 55 else "")
+                lines.append(f"{i}. `{dt}` — _{p}_")
+            text = "\n".join(lines)
+        await query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    elif data == "ask_clear":
+        await query.message.reply_text(
+            "⚠️ *Удалить всю историю?*", parse_mode=ParseMode.MARKDOWN,
+            reply_markup=kb_confirm_clear())
+    elif data == "clear_confirm":
+        db_clear_history(user_id)
+        await query.message.reply_text("✅ *История удалена!* 🌱",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=kb_main())
+    elif data == "hint_image":
+        await query.message.reply_text(
+            "🎨 Команда: `/img <описание>`\n\n"
+            "• `/img лиса в осеннем лесу, акварель`\n"
+            "• `/img робот-самурай, киберпанк, 4K`",
+            parse_mode=ParseMode.MARKDOWN)
+    elif data == "hint_code":
+        await query.message.reply_text(
+            "💻 Просто опиши задачу:\n\n"
+            "• _«Напиши функцию на Python»_\n"
+            "• _«Найди баг в коде: [код]»_\n"
+            "• _«Объясни этот код»_",
+            parse_mode=ParseMode.MARKDOWN)
+    elif data == "rephrase":
+        await query.message.chat.send_action(ChatAction.TYPING)
+        reply = await ask_ai(user_id,
+            "Перефразируй свой предыдущий ответ — кратко и простым языком.")
+        await send_reply(query.message, reply, kb=kb_after_reply())
+    elif data.startswith("regen:"):
+        prompt = data[len("regen:"):]
+        await _do_generate_image(query.message, user_id, prompt)
+
+
+# ══════════════════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════════════════
+
+def main():
+    init_db()
+
+    # Запускаем веб-сервер в отдельном потоке
+    web_thread = threading.Thread(target=run_web_server, daemon=True)
+    web_thread.start()
+
+    # Запускаем бота
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    app.add_handler(CommandHandler("start",   cmd_start))
+    app.add_handler(CommandHandler("help",    cmd_help))
+    app.add_handler(CommandHandler("about",   cmd_about))
+    app.add_handler(CommandHandler("stats",   cmd_stats))
+    app.add_handler(CommandHandler("history", cmd_history))
+    app.add_handler(CommandHandler("clear",   cmd_clear))
+    app.add_handler(CommandHandler("img",     cmd_img))
+    app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(MessageHandler(filters.PHOTO,                   handle_photo))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    logger.info("🚀 NOVA AI Bot запущен!")
+    app.run_polling(drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    main()
