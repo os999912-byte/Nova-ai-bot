@@ -4,6 +4,7 @@
 ║  Brain: Groq (llama-3.3-70b)  — БЕСПЛАТНО              ║
 ║  Images: Pollinations.ai       — БЕСПЛАТНО              ║
 ║  Storage: SQLite               — БЕСПЛАТНО              ║
+║  Host: Render Web Service      — БЕСПЛАТНО              ║
 ╚══════════════════════════════════════════════════════════╝
 """
 
@@ -13,6 +14,8 @@ import logging
 import base64
 import sqlite3
 import httpx
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from io import BytesIO
 from pathlib import Path
 
@@ -39,11 +42,12 @@ logger = logging.getLogger("NOVA")
 #  CONFIG
 # ══════════════════════════════════════════════════════════
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-GROQ_API_KEY   = os.environ["GROQ_API_KEY"]          # бесплатно: console.groq.com
+GROQ_API_KEY   = os.environ["GROQ_API_KEY"]
+PORT           = int(os.environ.get("PORT", 8080))
 DB_PATH        = Path("nova_bot.db")
 
-MAX_HISTORY    = 30      # сообщений в контексте запроса
-MAX_DB_HISTORY = 1000    # сообщений в БД на пользователя
+MAX_HISTORY    = 30
+MAX_DB_HISTORY = 1000
 
 GROQ_MODEL        = "llama-3.3-70b-versatile"
 GROQ_VISION_MODEL = "llama-3.2-90b-vision-preview"
@@ -69,15 +73,33 @@ SYSTEM_PROMPT = """Ты — NOVA, умный AI-ассистент в Telegram, 
 Отвечай на том языке, на котором пишет пользователь."""
 
 # ══════════════════════════════════════════════════════════
+#  ВСТРОЕННЫЙ ВЕБ-СЕРВЕР (нужен для Render Web Service)
+# ══════════════════════════════════════════════════════════
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/html")
+        self.end_headers()
+        self.wfile.write(b"<h1>NOVA AI Bot is running!</h1>")
+
+    def log_message(self, format, *args):
+        pass  # отключаем лишние логи
+
+
+def run_web_server():
+    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+    logger.info("🌐 Веб-сервер запущен на порту %d", PORT)
+    server.serve_forever()
+
+
+# ══════════════════════════════════════════════════════════
 #  DATABASE
 # ══════════════════════════════════════════════════════════
 
 def init_db():
-    """Инициализация базы данных SQLite."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-
-    # Таблица пользователей
     c.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id     INTEGER PRIMARY KEY,
@@ -90,8 +112,6 @@ def init_db():
             img_count   INTEGER DEFAULT 0
         )
     """)
-
-    # Таблица сообщений (история диалогов)
     c.execute("""
         CREATE TABLE IF NOT EXISTS messages (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -103,8 +123,6 @@ def init_db():
             FOREIGN KEY (user_id) REFERENCES users(user_id)
         )
     """)
-
-    # Таблица сгенерированных картинок
     c.execute("""
         CREATE TABLE IF NOT EXISTS images (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -114,18 +132,14 @@ def init_db():
             created_at  TEXT DEFAULT (datetime('now'))
         )
     """)
-
-    # Индексы для скорости
     c.execute("CREATE INDEX IF NOT EXISTS idx_msg_user ON messages(user_id)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_img_user ON images(user_id)")
-
     conn.commit()
     conn.close()
     logger.info("✅ База данных готова: %s", DB_PATH)
 
 
 def db_upsert_user(user):
-    """Создать или обновить запись пользователя."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""
@@ -142,21 +156,18 @@ def db_upsert_user(user):
 
 
 def db_save_message(user_id: int, role: str, content: str, msg_type: str = "text"):
-    """Сохранить сообщение, оставив не более MAX_DB_HISTORY штук."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
         "INSERT INTO messages (user_id, role, content, msg_type) VALUES (?, ?, ?, ?)",
         (user_id, role, content, msg_type)
     )
-    # Удалить старые сверх лимита
     c.execute("""
         DELETE FROM messages WHERE user_id = ? AND id NOT IN (
             SELECT id FROM messages WHERE user_id = ?
             ORDER BY id DESC LIMIT ?
         )
     """, (user_id, user_id, MAX_DB_HISTORY))
-    # Обновить счётчик
     if role == "user":
         col = "img_count" if msg_type == "image" else "msg_count"
         c.execute(f"UPDATE users SET {col} = {col} + 1 WHERE user_id = ?", (user_id,))
@@ -165,7 +176,6 @@ def db_save_message(user_id: int, role: str, content: str, msg_type: str = "text
 
 
 def db_get_history(user_id: int) -> list[dict]:
-    """Загрузить последние MAX_HISTORY сообщений из БД."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""
@@ -179,7 +189,6 @@ def db_get_history(user_id: int) -> list[dict]:
 
 
 def db_clear_history(user_id: int):
-    """Удалить всю историю диалога пользователя."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("DELETE FROM messages WHERE user_id = ?", (user_id,))
@@ -188,7 +197,6 @@ def db_clear_history(user_id: int):
 
 
 def db_get_stats(user_id: int) -> dict:
-    """Получить статистику пользователя."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""
@@ -200,8 +208,7 @@ def db_get_stats(user_id: int) -> dict:
     if not row:
         return {}
     return dict(zip(
-        ["first_name", "username", "joined_at", "last_seen", "msg_count", "img_count"],
-        row
+        ["first_name", "username", "joined_at", "last_seen", "msg_count", "img_count"], row
     ))
 
 
@@ -235,7 +242,6 @@ groq_client = Groq(api_key=GROQ_API_KEY)
 
 
 async def ask_ai(user_id: int, user_text: str) -> str:
-    """Отправить запрос в Groq LLM, вернуть ответ."""
     db_save_message(user_id, "user", user_text)
     history = db_get_history(user_id)
     try:
@@ -254,7 +260,6 @@ async def ask_ai(user_id: int, user_text: str) -> str:
 
 
 async def generate_image(prompt: str, user_id: int) -> tuple[bytes | None, str]:
-    """Генерация картинки через Pollinations.ai (бесплатно, без ключа)."""
     import urllib.parse
     encoded = urllib.parse.quote(prompt)
     url = (
@@ -279,24 +284,24 @@ async def generate_image(prompt: str, user_id: int) -> tuple[bytes | None, str]:
 def kb_main():
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🎨 Нарисовать",      callback_data="hint_image"),
-            InlineKeyboardButton("💻 Код",             callback_data="hint_code"),
+            InlineKeyboardButton("🎨 Нарисовать",       callback_data="hint_image"),
+            InlineKeyboardButton("💻 Код",              callback_data="hint_code"),
         ],
         [
-            InlineKeyboardButton("📊 Статистика",      callback_data="my_stats"),
-            InlineKeyboardButton("🖼 Мои картинки",    callback_data="img_history"),
+            InlineKeyboardButton("📊 Статистика",       callback_data="my_stats"),
+            InlineKeyboardButton("🖼 Мои картинки",     callback_data="img_history"),
         ],
         [
             InlineKeyboardButton("🗑 Очистить историю", callback_data="ask_clear"),
-            InlineKeyboardButton("❓ Помощь",           callback_data="show_help"),
+            InlineKeyboardButton("❓ Помощь",            callback_data="show_help"),
         ],
     ])
 
 
 def kb_after_reply():
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("🔄 Перефразируй",  callback_data="rephrase"),
-        InlineKeyboardButton("📋 Меню",          callback_data="main_menu"),
+        InlineKeyboardButton("🔄 Перефразируй", callback_data="rephrase"),
+        InlineKeyboardButton("📋 Меню",         callback_data="main_menu"),
     ]])
 
 
@@ -308,9 +313,8 @@ def kb_confirm_clear():
 
 
 def kb_after_image(prompt: str):
-    safe = prompt[:200]
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("🔄 Ещё вариант", callback_data=f"regen:{safe}"),
+        InlineKeyboardButton("🔄 Ещё вариант", callback_data=f"regen:{prompt[:200]}"),
         InlineKeyboardButton("📋 Меню",        callback_data="main_menu"),
     ]])
 
@@ -339,14 +343,13 @@ def split_message(text: str, limit: int = 4000) -> list[str]:
 
 
 async def send_reply(update_or_message, text: str, kb=None):
-    """Отправить ответ с авто-фолбэком при ошибке парсинга."""
     msg = getattr(update_or_message, "message", update_or_message)
     for part in split_message(text):
         try:
             await msg.reply_text(part, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
         except Exception:
             await msg.reply_text(part, reply_markup=kb)
-        kb = None  # keyboard только у последней части
+        kb = None
 
 
 # ══════════════════════════════════════════════════════════
@@ -356,10 +359,9 @@ async def send_reply(update_or_message, text: str, kb=None):
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     db_upsert_user(user)
-    stats = db_get_stats(user.id)
+    stats  = db_get_stats(user.id)
     is_new = stats.get("msg_count", 0) == 0
     greet  = "👋 С возвращением" if not is_new else "👋 Привет"
-
     text = (
         f"{greet}, *{user.first_name}*!\n\n"
         "Я — *NOVA*, твой AI-ассистент на базе *LLaMA 3.3 70B*.\n\n"
@@ -393,12 +395,6 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/clear — очистить диалог\n"
         "/about — о боте\n\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
-        "*Советы:*\n"
-        "• Чем подробнее вопрос — тем лучше ответ\n"
-        "• Укажи язык для кода: _«на Python»_, _«на JS»_\n"
-        "• Для картинок: `/img лиса, аниме, 4K, акварель`\n"
-        "• Просто напиши _«нарисуй...»_ — я пойму!\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
         "🆓 *100% бесплатно* — без скрытых платежей"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN,
@@ -413,12 +409,10 @@ async def cmd_about(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "🧠 *Модель:* LLaMA 3.3 70B\n"
         "⚡ *Инференс:* Groq Cloud\n"
         "🎨 *Картинки:* Pollinations.ai\n"
-        "🗄 *БД:* SQLite (локально)\n"
-        "🔧 *Фреймворк:* python-telegram-bot 20+\n\n"
+        "🗄 *БД:* SQLite\n"
+        "🔧 *Хостинг:* Render.com\n\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
         "💚 *Стоимость:* абсолютно бесплатно\n"
-        "🔒 *Приватность:* история хранится\n"
-        "   только на твоём сервере\n"
         "⚡ *Скорость:* ~500 токенов/сек"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN,
@@ -439,11 +433,10 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "║   📊  МОЯ СТАТИСТИКА   ║\n"
         "╚════════════════════════╝\n\n"
         f"👤 *Имя:* {s.get('first_name', '—')}\n"
-        f"🔖 *Username:* @{s.get('username') or '—'}\n\n"
         f"📅 *С нами с:* `{joined}`\n"
         f"🕐 *Последний визит:* `{last}`\n\n"
-        f"💬 *Сообщений отправлено:* *{s.get('msg_count', 0)}*\n"
-        f"🎨 *Картинок создано:* *{s.get('img_count', 0)}*\n"
+        f"💬 *Сообщений:* *{s.get('msg_count', 0)}*\n"
+        f"🎨 *Картинок:* *{s.get('img_count', 0)}*\n"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN,
                                     reply_markup=kb_main())
@@ -453,12 +446,12 @@ async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     items = db_get_image_history(user_id)
     if not items:
-        text = "🖼 У тебя пока нет сгенерированных картинок.\n\nПопробуй: `/img котик в лесу`"
+        text = "🖼 Картинок пока нет. Попробуй: `/img котик в лесу`"
     else:
-        lines = ["*🖼 Последние картинки:*\n"]
+        lines = ["*🖼 Твои последние картинки:*\n"]
         for i, item in enumerate(items, 1):
             dt = (item["created_at"] or "")[:16].replace("T", " ")
-            p  = item["prompt"][:60] + ("…" if len(item["prompt"]) > 60 else "")
+            p  = item["prompt"][:55] + ("…" if len(item["prompt"]) > 55 else "")
             lines.append(f"{i}. `{dt}` — _{p}_")
         text = "\n".join(lines)
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN,
@@ -467,7 +460,7 @@ async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "⚠️ *Удалить всю историю диалога?*\n\nЭто действие нельзя отменить.",
+        "⚠️ *Удалить всю историю диалога?*\n\nЭто нельзя отменить.",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=kb_confirm_clear()
     )
@@ -478,12 +471,10 @@ async def cmd_img(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     prompt = " ".join(ctx.args).strip()
     if not prompt:
         await update.message.reply_text(
-            "🎨 *Генерация картинок*\n\n"
-            "Используй: `/img <описание>`\n\n"
+            "🎨 *Генерация картинок*\n\nИспользуй: `/img <описание>`\n\n"
             "*Примеры:*\n"
             "• `/img закат над океаном, масло, импрессионизм`\n"
-            "• `/img кот-самурай в Токио, аниме, 4K`\n"
-            "• `/img футуристический город, киберпанк, ночь`",
+            "• `/img кот-самурай в Токио, аниме, 4K`",
             parse_mode=ParseMode.MARKDOWN
         )
         return
@@ -491,7 +482,6 @@ async def cmd_img(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def _do_generate_image(msg, user_id: int, prompt: str):
-    """Общая функция генерации и отправки изображения."""
     status = await msg.reply_text(
         f"🎨 *Рисую:* _{prompt}_\n\n⏳ Подожди 15–30 секунд…",
         parse_mode=ParseMode.MARKDOWN
@@ -502,10 +492,8 @@ async def _do_generate_image(msg, user_id: int, prompt: str):
         await status.delete()
     except Exception:
         pass
-
     if image_bytes:
-        short_prompt = prompt[:200]
-        caption = f"🎨 *{short_prompt}*\n\n_✅ Сгенерировано через Pollinations.ai_"
+        caption = f"🎨 *{prompt[:200]}*\n\n_✅ Сгенерировано через Pollinations.ai_"
         try:
             await msg.reply_photo(
                 photo=BytesIO(image_bytes),
@@ -516,18 +504,15 @@ async def _do_generate_image(msg, user_id: int, prompt: str):
         except Exception:
             await msg.reply_photo(
                 photo=BytesIO(image_bytes),
-                caption=short_prompt,
+                caption=prompt[:200],
                 reply_markup=kb_after_image(prompt)
             )
     else:
-        await msg.reply_text(
-            "⚠️ Не удалось сгенерировать. Попробуй другое описание или подожди немного.",
-            reply_markup=kb_main()
-        )
+        await msg.reply_text("⚠️ Не удалось сгенерировать. Попробуй другое описание.")
 
 
 # ══════════════════════════════════════════════════════════
-#  MESSAGE HANDLER
+#  MESSAGE HANDLERS
 # ══════════════════════════════════════════════════════════
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -536,7 +521,6 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text    = update.message.text.strip()
     db_upsert_user(user)
 
-    # Определяем запрос на картинку
     image_kw = [
         "нарисуй", "нарисовать", "сгенерируй картинку", "создай картинку",
         "создай изображение", "нарисуй мне", "сделай картинку",
@@ -547,29 +531,21 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _do_generate_image(update.message, user_id, text)
         return
 
-    # Обычный чат
     await update.message.chat.send_action(ChatAction.TYPING)
     reply = await ask_ai(user_id, text)
     await send_reply(update, reply, kb=kb_after_reply())
 
 
-# ══════════════════════════════════════════════════════════
-#  PHOTO HANDLER
-# ══════════════════════════════════════════════════════════
-
 async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     db_upsert_user(update.effective_user)
     caption = update.message.caption or "Опиши подробно что изображено на этой картинке."
-
     await update.message.chat.send_action(ChatAction.TYPING)
-
     photo = update.message.photo[-1]
     file  = await photo.get_file()
     buf   = BytesIO()
     await file.download_to_memory(buf)
     image_b64 = base64.standard_b64encode(buf.getvalue()).decode()
-
     try:
         resp = groq_client.chat.completions.create(
             model=GROQ_VISION_MODEL,
@@ -585,152 +561,12 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         reply = resp.choices[0].message.content
     except Exception as e:
-        logger.warning("Vision model failed: %s — using text fallback", e)
+        logger.warning("Vision failed: %s", e)
         reply = await ask_ai(user_id,
-            f"Пользователь прислал фото с подписью: «{caption}». "
-            "Ответь на вопрос из подписи. (Ты не видишь само фото, объясни это вежливо.)")
-
+            f"Пользователь прислал фото с подписью: «{caption}». Ответь на вопрос.")
     db_save_message(user_id, "user",      f"[Фото] {caption}", "photo")
     db_save_message(user_id, "assistant", reply)
     await send_reply(update, reply, kb=kb_after_reply())
 
 
-# ══════════════════════════════════════════════════════════
-#  CALLBACK HANDLER
-# ══════════════════════════════════════════════════════════
-
-async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query   = update.callback_query
-    user_id = update.effective_user.id
-    data    = query.data
-    await query.answer()
-
-    if data == "main_menu":
-        await query.message.reply_text(
-            "📋 *Главное меню* — что хочешь сделать?",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=kb_main()
-        )
-
-    elif data == "show_help":
-        await query.message.reply_text(
-            "📖 *Быстрая справка:*\n\n"
-            "• Просто пиши — я отвечу\n"
-            "• `/img <текст>` — генерация картинки\n"
-            "• `/stats` — твоя статистика\n"
-            "• `/history` — история картинок\n"
-            "• `/clear` — очистить историю\n\n"
-            "_История сохраняется в базе данных автоматически_",
-            parse_mode=ParseMode.MARKDOWN
-        )
-
-    elif data == "my_stats":
-        db_upsert_user(update.effective_user)
-        s = db_get_stats(user_id)
-        if not s:
-            await query.message.reply_text("📊 Нет данных.")
-            return
-        joined = (s.get("joined_at") or "")[:10]
-        last   = (s.get("last_seen") or "")[:16].replace("T", " ")
-        text = (
-            "╔════════════════════════╗\n"
-            "║   📊  МОЯ СТАТИСТИКА   ║\n"
-            "╚════════════════════════╝\n\n"
-            f"👤 *Имя:* {s.get('first_name', '—')}\n"
-            f"📅 *С нами с:* `{joined}`\n"
-            f"🕐 *Последний визит:* `{last}`\n\n"
-            f"💬 *Сообщений:* *{s.get('msg_count', 0)}*\n"
-            f"🎨 *Картинок:* *{s.get('img_count', 0)}*\n"
-        )
-        await query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-
-    elif data == "img_history":
-        items = db_get_image_history(user_id)
-        if not items:
-            text = "🖼 Картинок пока нет. Попробуй: `/img котик в лесу`"
-        else:
-            lines = ["*🖼 Твои последние картинки:*\n"]
-            for i, item in enumerate(items, 1):
-                dt = (item["created_at"] or "")[:16].replace("T", " ")
-                p  = item["prompt"][:55] + ("…" if len(item["prompt"]) > 55 else "")
-                lines.append(f"{i}. `{dt}` — _{p}_")
-            text = "\n".join(lines)
-        await query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-
-    elif data == "ask_clear":
-        await query.message.reply_text(
-            "⚠️ *Удалить всю историю диалога?*\n\nЭто нельзя отменить.",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=kb_confirm_clear()
-        )
-
-    elif data == "clear_confirm":
-        db_clear_history(user_id)
-        await query.message.reply_text(
-            "✅ *История удалена!*\n\nМожем начать заново 🌱",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=kb_main()
-        )
-
-    elif data == "hint_image":
-        await query.message.reply_text(
-            "🎨 *Генерация картинок*\n\n"
-            "Команда: `/img <описание>`\n\n"
-            "*Примеры:*\n"
-            "• `/img лиса в осеннем лесу, акварель`\n"
-            "• `/img робот-самурай, киберпанк, 4K`\n"
-            "• `/img горный закат, фото, высокое разрешение`\n\n"
-            "_⏱ Генерация занимает ~15–30 секунд_",
-            parse_mode=ParseMode.MARKDOWN
-        )
-
-    elif data == "hint_code":
-        await query.message.reply_text(
-            "💻 *Помощь с кодом*\n\n"
-            "Просто опиши задачу, например:\n\n"
-            "• _«Напиши функцию на Python для поиска дубликатов в списке»_\n"
-            "• _«Объясни этот код: [вставь сюда код]»_\n"
-            "• _«Найди и исправь баг: [вставь код]»_\n"
-            "• _«Переведи с JS на TypeScript»_\n\n"
-            "Я поддерживаю Python, JS, TS, Go, Rust, C++, Java и другие языки.",
-            parse_mode=ParseMode.MARKDOWN
-        )
-
-    elif data == "rephrase":
-        await query.message.chat.send_action(ChatAction.TYPING)
-        reply = await ask_ai(user_id,
-            "Перефразируй свой предыдущий ответ — более кратко и простым языком.")
-        await send_reply(query.message, reply, kb=kb_after_reply())
-
-    elif data.startswith("regen:"):
-        prompt = data[len("regen:"):]
-        await _do_generate_image(query.message, user_id, prompt)
-
-
-# ══════════════════════════════════════════════════════════
-#  MAIN
-# ══════════════════════════════════════════════════════════
-
-def main():
-    init_db()
-
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-
-    app.add_handler(CommandHandler("start",   cmd_start))
-    app.add_handler(CommandHandler("help",    cmd_help))
-    app.add_handler(CommandHandler("about",   cmd_about))
-    app.add_handler(CommandHandler("stats",   cmd_stats))
-    app.add_handler(CommandHandler("history", cmd_history))
-    app.add_handler(CommandHandler("clear",   cmd_clear))
-    app.add_handler(CommandHandler("img",     cmd_img))
-
-    app.add_handler(CallbackQueryHandler(handle_callback))
-    app.add_handler(MessageHandler(filters.PHOTO,                  handle_photo))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    logger.info("🚀 NOVA AI Bot запущен!")
-    app.run_polling(drop_pending_updates=True)
-
-
-if __name__ == "__main__":
-    main()
+async def
