@@ -526,8 +526,8 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("⚠️ *Удалить всю историю?*",
             parse_mode=ParseMode.MARKDOWN, reply_markup=kb_confirm_clear())
     elif data == "clear_confirm":
-        db_clear_his
-                await query.message.reply_text("✅ *История удалена!* 🌱",
+        db_clear_his        
+        await query.message.reply_text("✅ *История удалена!* 🌱",
             parse_mode=ParseMode.MARKDOWN, reply_markup=kb_main())
     elif data == "hint_image":
         await query.message.reply_text(
