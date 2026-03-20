@@ -527,3 +527,53 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.MARKDOWN, reply_markup=kb_confirm_clear())
     elif data == "clear_confirm":
         db_clear_his
+                await query.message.reply_text("✅ *История удалена!* 🌱",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=kb_main())
+    elif data == "hint_image":
+        await query.message.reply_text(
+            "🎨 Команда: `/img <описание>`\n\n"
+            "• `/img лиса в лесу, акварель`\n• `/img робот, киберпанк, 4K`",
+            parse_mode=ParseMode.MARKDOWN)
+    elif data == "hint_code":
+        await query.message.reply_text(
+            "💻 Просто опиши задачу:\n\n"
+            "• _«Напиши функцию на Python»_\n• _«Найди баг: [код]»_",
+            parse_mode=ParseMode.MARKDOWN)
+    elif data == "rephrase":
+        await query.message.chat.send_action(ChatAction.TYPING)
+        reply = await ask_ai(user_id,
+            "Перефразируй свой предыдущий ответ кратко и простым языком.")
+        await send_reply(query.message, reply, kb=kb_after_reply())
+    elif data.startswith("regen:"):
+        await do_generate(query.message, user_id, data[len("regen:"):])
+
+
+# ══════════════════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════════════════
+
+def main():
+    init_db()
+
+    # Веб-сервер в отдельном потоке
+    threading.Thread(target=run_web_server, daemon=True).start()
+
+    # Telegram бот
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("start",   cmd_start))
+    app.add_handler(CommandHandler("help",    cmd_help))
+    app.add_handler(CommandHandler("about",   cmd_about))
+    app.add_handler(CommandHandler("stats",   cmd_stats))
+    app.add_handler(CommandHandler("history", cmd_history))
+    app.add_handler(CommandHandler("clear",   cmd_clear))
+    app.add_handler(CommandHandler("img",     cmd_img))
+    app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(MessageHandler(filters.PHOTO,                   handle_photo))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    logger.info("🚀 NOVA AI Bot запущен!")
+    app.run_polling(drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    main()
